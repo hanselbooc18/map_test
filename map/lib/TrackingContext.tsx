@@ -2,6 +2,7 @@ import * as Location from 'expo-location';
 import * as Network from 'expo-network';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
+import { isApiConfigured } from './api';
 import {
   getLatestLocation,
   getLocations,
@@ -10,7 +11,7 @@ import {
   setSetting,
 } from './database';
 import { startBackgroundLocationUpdates, stopBackgroundLocationUpdates } from './background';
-import { captureCurrentLocation, syncPendingLocations } from './tracking';
+import { captureCurrentLocation, syncPendingLocationUpdates } from './tracking';
 import type { LocationUpdate, TrackingSettings, UsageTotals } from './types';
 
 type PermissionState = {
@@ -27,10 +28,11 @@ type TrackingContextValue = {
   online: boolean | null;
   busy: boolean;
   error: string | null;
+  backendConfigured: boolean;
   refresh: () => Promise<void>;
+  syncPending: () => Promise<void>;
   enableTracking: () => Promise<void>;
   disableTracking: () => Promise<void>;
-  syncNow: () => Promise<void>;
   captureNow: () => Promise<void>;
   clearError: () => void;
 };
@@ -49,6 +51,7 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
   const [online, setOnline] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const backendConfigured = isApiConfigured();
 
   const refresh = useCallback(async () => {
     const [storedSettings, storedLatest, storedLocations, usage, network, foreground, background] =
@@ -69,10 +72,42 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
     setPermissions({ foreground: foreground.status, background: background.status });
   }, []);
 
+  const syncPending = useCallback(async () => {
+    if (!backendConfigured) {
+      const message = 'Configure EXPO_PUBLIC_API_URL (or EXPO_PUBLIC_API_BASE_URL) with the laptop Laravel API address before syncing.';
+      setError(message);
+      throw new Error(message);
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await syncPendingLocationUpdates();
+      await refresh();
+      if (result.failed > 0) {
+        const message = result.errors[0] ?? `${result.failed} location update(s) could not be synced.`;
+        setError(message);
+        throw new Error(message);
+      }
+    } catch (syncError) {
+      const message = syncError instanceof Error ? syncError.message : 'Could not sync GPS data to the backend.';
+      setError(message);
+      await refresh();
+      throw syncError;
+    } finally {
+      setBusy(false);
+    }
+  }, [backendConfigured, refresh]);
+
   useEffect(() => {
     let active = true;
+    let wasOnline = false;
     const initialize = async () => {
       await refresh();
+      const network = await Network.getNetworkStateAsync();
+      wasOnline = network.isConnected === true && network.isInternetReachable !== false;
+      if (wasOnline && backendConfigured) {
+        void syncPending().catch(() => undefined);
+      }
       const storedSettings = await getSettings();
       const [foreground, background] = await Promise.all([
         Location.getForegroundPermissionsAsync(),
@@ -81,7 +116,6 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
       if (storedSettings.enabled && foreground.status === 'granted' && background.status === 'granted') {
         await startBackgroundLocationUpdates();
       }
-      await syncPendingLocations();
     };
     initialize().catch((loadError) => {
       if (active) setError(
@@ -98,20 +132,17 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
     const subscription = Network.addNetworkStateListener((state) => {
       const connected = Boolean(state.isConnected && state.isInternetReachable !== false);
       setOnline(connected);
-      if (connected) {
-        syncPendingLocations()
-          .then(refresh)
-          .catch((syncError) => setError(
-            syncError instanceof Error ? syncError.message : 'Could not synchronize updates.'
-          ));
+      if (connected && !wasOnline && backendConfigured) {
+        void syncPending().catch(() => undefined);
       }
+      wasOnline = connected;
     });
     return () => {
       active = false;
       clearInterval(timer);
       subscription.remove();
     };
-  }, [refresh, settings?.enabled]);
+  }, [backendConfigured, refresh, settings?.enabled, syncPending]);
 
   const perform = useCallback(async (action: () => Promise<void>) => {
     setBusy(true);
@@ -151,7 +182,6 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
     await setSetting('enabled', 'false');
   }), [perform]);
 
-  const syncNow = useCallback(() => perform(syncPendingLocations), [perform]);
   const captureNow = useCallback(() => perform(captureCurrentLocation), [perform]);
   const clearError = useCallback(() => setError(null), []);
 
@@ -164,15 +194,16 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
     online,
     busy,
     error,
+    backendConfigured,
     refresh,
+    syncPending,
     enableTracking,
     disableTracking,
-    syncNow,
     captureNow,
     clearError,
   }), [
     settings, latest, locations, totals, permissions, online, busy, error,
-    refresh, enableTracking, disableTracking, syncNow, captureNow, clearError,
+    backendConfigured, refresh, syncPending, enableTracking, disableTracking, captureNow, clearError,
   ]);
 
   return <TrackingContext.Provider value={value}>{children}</TrackingContext.Provider>;

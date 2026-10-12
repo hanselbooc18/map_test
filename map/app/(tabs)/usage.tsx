@@ -1,42 +1,21 @@
-import { useEffect, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
-import { Button, Card, Label, Notice, palette, Screen, ScreenHeading, StatCard } from '@/components/mobile-ui';
-import { getRemoteUsageSummary, isApiConfigured } from '@/lib/api';
+import { Card, Label, Notice, palette, Screen, ScreenHeading, StatCard } from '@/components/mobile-ui';
 import { formatBytes } from '@/lib/bytes';
 import { useTracking } from '@/lib/TrackingContext';
 
 export default function UsageScreen() {
-  const { settings, totals, online, busy, syncNow } = useTracking();
-  const [remoteMessage, setRemoteMessage] = useState<string | null>(null);
-  const [remoteError, setRemoteError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!settings || !online || !isApiConfigured()) return;
-    let active = true;
-    getRemoteUsageSummary(settings)
-      .then(() => {
-        if (active) {
-          setRemoteMessage('Connected to the backend usage summary. Figures below are calculated from this device’s local update log.');
-          setRemoteError(null);
-        }
-      })
-      .catch((error) => {
-        if (active) setRemoteError(error instanceof Error ? error.message : 'Could not load server usage summary.');
-      });
-    return () => { active = false; };
-  }, [settings?.deviceId, online]);
+  const { totals } = useTracking();
 
   const maxDaily = Math.max(1, ...(totals?.daily.map((day) => day.bytes) ?? [0]));
 
   return (
     <Screen>
-      <ScreenHeading title="Data usage" subtitle="Estimated network transfer for location updates." />
+      <ScreenHeading title="Data usage" subtitle="Estimated network traffic from GPS reports sent to Laravel." />
 
-      <Notice>
-        Estimated only. The app adds request/response body sizes and approximate HTTP headers; TLS, TCP/IP,
-        retries, acknowledgements, and other system traffic are not fully observable from the app.
-        These figures do not represent all data used by your phone.
+      <Notice tone="info">
+        Traffic totals are estimates from GPS upload and API responses, not exact cellular accounting. OpenStreetMap
+        tile traffic is not included. Failed and pending reports may not yet be recorded by the server.
       </Notice>
 
       <View style={styles.statGrid}>
@@ -73,7 +52,7 @@ export default function UsageScreen() {
             </View>
             <Text style={styles.barValue}>{formatBytes(day.bytes)}</Text>
           </View>
-        )) : <Text style={styles.emptyText}>No location update usage has been recorded yet.</Text>}
+        )) : <Text style={styles.emptyText}>No GPS report transfer estimates yet. Configure the Laravel API and sync a location first.</Text>}
       </Card>
 
       <View style={styles.statGrid}>
@@ -81,9 +60,6 @@ export default function UsageScreen() {
         <StatCard label="FAILED UPDATES" value={String(totals?.failed ?? 0)} />
       </View>
 
-      {remoteMessage ? <Notice>{remoteMessage}</Notice> : null}
-      {remoteError ? <Notice tone="warning">Could not retrieve the backend summary: {remoteError}</Notice> : null}
-      <Button title="Sync pending updates" secondary onPress={() => { void syncNow().catch(() => undefined); }} disabled={busy} />
     </Screen>
   );
 }

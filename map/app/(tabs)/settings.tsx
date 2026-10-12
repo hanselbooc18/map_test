@@ -1,7 +1,8 @@
-import { Switch, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { Switch, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { Button, Card, Label, Notice, palette, Screen, ScreenHeading } from '@/components/mobile-ui';
-import { isApiConfigured } from '@/lib/api';
+import { getEnrollmentCode, saveEnrollmentCode } from '@/lib/api';
 import { useTracking } from '@/lib/TrackingContext';
 
 function permissionLabel(status: string): string {
@@ -10,9 +11,22 @@ function permissionLabel(status: string): string {
 
 export default function SettingsScreen() {
   const {
-    settings, permissions, online, busy, error, enableTracking, disableTracking,
-    syncNow, clearError,
+    settings, locations, permissions, online, busy, error, backendConfigured,
+    enableTracking, disableTracking, syncPending, clearError,
   } = useTracking();
+  const [enrollmentCode, setEnrollmentCode] = useState('');
+  const [hasEnrollmentCode, setHasEnrollmentCode] = useState(false);
+  const [savingCode, setSavingCode] = useState(false);
+  const [codeMessage, setCodeMessage] = useState<string | null>(null);
+  const pendingCount = locations.filter((location) => location.status !== 'success').length;
+
+  useEffect(() => {
+    getEnrollmentCode()
+      .then((code) => setHasEnrollmentCode(Boolean(code)))
+      .catch((loadError) => setCodeMessage(
+        loadError instanceof Error ? loadError.message : 'Could not load the saved enrollment code.'
+      ));
+  }, []);
 
   if (!settings) {
     return <Screen><Text style={styles.body}>Loading settings…</Text></Screen>;
@@ -20,13 +34,13 @@ export default function SettingsScreen() {
 
   return (
     <Screen>
-      <ScreenHeading title="Settings" subtitle="Control background tracking and synchronization." />
+      <ScreenHeading title="Settings" subtitle="Control GPS tracking, backend sync, and permissions." />
 
       <Card>
         <View style={styles.switchRow}>
           <View style={styles.switchText}>
             <Text style={styles.cardTitle}>Device tracking</Text>
-            <Text style={styles.body}>Collect and sync location while tracking is enabled.</Text>
+            <Text style={styles.body}>Collect GPS fixes on this phone; upload them when the Laravel API is reachable.</Text>
           </View>
           <Switch
             value={settings.enabled}
@@ -72,37 +86,76 @@ export default function SettingsScreen() {
       </Card>
 
       <Card>
-        <Text style={styles.cardTitle}>Connectivity & privacy</Text>
+        <Text style={styles.cardTitle}>Connectivity & local storage</Text>
         <View style={styles.permissionRow}>
-          <Text style={styles.body}>Internet connection</Text>
+          <Text style={styles.body}>Internet for map tiles</Text>
           <Text style={online ? styles.allowed : styles.denied}>
             {online === null ? 'Checking' : online ? 'Online' : 'Offline'}
           </Text>
         </View>
-        <View style={styles.permissionRow}>
-          <Text style={styles.body}>Measurement mode</Text>
-          <Text style={styles.allowed}>Estimated</Text>
-        </View>
         <Text style={styles.body}>
-          Transfer estimates include JSON body sizes and approximate HTTP headers. Cellular, TLS, TCP/IP,
-          retries, and other phone traffic are not measured by this app.
+          Every GPS fix is first saved on this phone, then queued for upload to the configured Laravel API.
+          Map-tile connectivity is separate from backend availability.
         </Text>
       </Card>
 
       <Card>
-        <Text style={styles.cardTitle}>Backend</Text>
+        <Text style={styles.cardTitle}>Laravel / MySQL sync</Text>
+        <View style={styles.permissionRow}>
+          <Text style={styles.body}>API URL configured</Text>
+          <Text style={backendConfigured ? styles.allowed : styles.denied}>
+            {backendConfigured ? 'Yes' : 'No'}
+          </Text>
+        </View>
         <Text style={styles.body}>
-          {isApiConfigured()
-            ? 'API base URL is configured. Device access tokens are stored in the platform secure store.'
-            : 'No backend URL is configured. Location and usage records remain on this device; uploads will fail visibly until configured.'}
+          Pending or failed location reports: {pendingCount}. The phone sends data to Laravel; Laravel stores it in MySQL.
+          The phone must be on the same Wi-Fi as your laptop, and the API URL must use the laptop's LAN IP, not localhost.
         </Text>
-        <Text style={styles.deviceId}>Device ID: {settings.deviceId}</Text>
+        <Button
+          title={`Sync pending reports (${pendingCount})`}
+          secondary
+          disabled={busy || pendingCount === 0}
+          onPress={() => { void syncPending().catch(() => undefined); }}
+        />
+        <Label>ENROLLMENT CODE (IF REQUIRED BY YOUR SERVER)</Label>
+        <TextInput
+          value={enrollmentCode}
+          onChangeText={(value) => {
+            setEnrollmentCode(value);
+            setCodeMessage(null);
+          }}
+          placeholder={hasEnrollmentCode ? 'A code is already saved securely' : 'Enter server enrollment code'}
+          placeholderTextColor={palette.muted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          secureTextEntry
+          style={styles.input}
+          accessibilityLabel="Laravel device enrollment code"
+        />
+        <Button
+          title={savingCode ? 'Saving…' : 'Save enrollment code'}
+          secondary
+          disabled={savingCode}
+          onPress={() => {
+            setSavingCode(true);
+            saveEnrollmentCode(enrollmentCode)
+              .then(() => {
+                setEnrollmentCode('');
+                setHasEnrollmentCode(Boolean(enrollmentCode.trim()));
+                setCodeMessage('Enrollment code saved securely on this phone.');
+              })
+              .catch((saveError) => setCodeMessage(
+                saveError instanceof Error ? saveError.message : 'Could not save the enrollment code.'
+              ))
+              .finally(() => setSavingCode(false));
+          }}
+        />
+        {codeMessage ? <Text style={styles.body}>{codeMessage}</Text> : null}
       </Card>
 
       {error ? <Notice tone="error">{error}</Notice> : null}
       {error ? <Button title="Dismiss message" secondary onPress={clearError} /> : null}
-      <Button title="Sync Now" onPress={() => { void syncNow().catch(() => undefined); }} disabled={busy} />
-      <Text style={styles.footer}>Pending updates are retried with the same update ID to prevent duplicate server records.</Text>
+      <Text style={styles.footer}>Background updates are requested every 10 seconds. Android may defer fixes because of GPS reception, permissions, or battery restrictions.</Text>
     </Screen>
   );
 }
@@ -118,6 +171,13 @@ const styles = StyleSheet.create({
   permissionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   allowed: { color: palette.green, fontWeight: '800', fontSize: 12 },
   denied: { color: palette.amber, fontWeight: '800', fontSize: 12 },
-  deviceId: { color: palette.ink, fontSize: 10, fontVariant: ['tabular-nums'] },
+  input: {
+    minHeight: 46,
+    borderColor: palette.border,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    color: palette.ink,
+  },
   footer: { color: palette.muted, fontSize: 11, textAlign: 'center', lineHeight: 16 },
 });

@@ -30,7 +30,7 @@ export default function TabLayout() {
         ),
       })}
     >
-      <Tabs.Screen name="index" options={{ title: 'Tracking' }} />
+      <Tabs.Screen name="index" options={{ title: 'GPS Test' }} />
       <Tabs.Screen name="usage" options={{ title: 'Data Usage' }} />
       <Tabs.Screen name="history" options={{ title: 'History' }} />
       <Tabs.Screen name="settings" options={{ title: 'Settings' }} />

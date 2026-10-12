@@ -1,98 +1,85 @@
 import * as Crypto from 'expo-crypto';
 import * as Location from 'expo-location';
-import * as Network from 'expo-network';
 
-import { estimateTransfer, isApiConfigured, submitLocation, ApiError } from './api';
 import {
   getLatestLocation,
-  hasLocationTimestamp,
   getPendingLocations,
+  hasLocationTimestamp,
   getSettings,
   saveLocation,
   updateUsage,
 } from './database';
+import { estimateTransfer, isApiConfigured, submitLocation } from './api';
 import { utf8ByteLength } from './bytes';
 import type { LocationUpdate } from './types';
 
 export const LOCATION_TASK_NAME = 'device-background-location';
 let locationWriteQueue: Promise<void> = Promise.resolve();
-const activeTransmissions = new Map<string, Promise<void>>();
+const locationSyncs = new Map<string, Promise<{ succeeded: boolean; error: string | null }>>();
 
-function estimatedRequestBodyBytes(update: LocationUpdate): number {
-  const locationBody = {
-    updateId: update.id,
-    deviceId: update.device_id,
-    timestamp: update.created_at,
-    latitude: update.latitude,
-    longitude: update.longitude,
-    coordinatePayloadBytes: update.coordinate_bytes,
-  };
-  const usageBody = {
-    updateId: update.id,
-    deviceId: update.device_id,
-    timestamp: update.created_at,
-    coordinatePayloadBytes: update.coordinate_bytes,
-    measurementMode: 'estimated',
-  };
-  return utf8ByteLength(JSON.stringify(locationBody)) + utf8ByteLength(JSON.stringify(usageBody));
-}
+async function syncLocationUpdate(
+  update: LocationUpdate
+): Promise<{ succeeded: boolean; error: string | null }> {
+  const currentSync = locationSyncs.get(update.id);
+  if (currentSync) return currentSync;
 
-async function transmitOnce(update: LocationUpdate): Promise<void> {
-  const settings = await getSettings();
-  if (!isApiConfigured()) {
-    await updateUsage(update.id, {
-      request_body_bytes: 0,
-      response_body_bytes: 0,
-      upload_bytes: 0,
-      download_bytes: 0,
-      total_bytes: 0,
-    }, 'failed', 'Backend URL is not configured.');
-    return;
-  }
+  const sync = (async () => {
+    let requestBodyBytes = 0;
+    let responseBodyBytes = 0;
+    let locationSucceeded = false;
+    let usageSucceeded = false;
+    let errors: string[] = [];
 
-  const connectivity = await Network.getNetworkStateAsync();
-  if (!connectivity.isConnected || connectivity.isInternetReachable === false) return;
+    try {
+      const result = await submitLocation(await getSettings(), update);
+      requestBodyBytes = result.requestBodyBytes;
+      responseBodyBytes = result.responseBodyBytes;
+      locationSucceeded = result.locationSucceeded;
+      usageSucceeded = result.usageSucceeded;
+      if (result.locationError) errors.push(result.locationError);
+      if (result.usageError) errors.push(result.usageError);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'Location upload failed.');
+    }
 
-  const requestBodyBytes = estimatedRequestBodyBytes(update);
-  try {
-    const result = await submitLocation(settings, update);
-    const transfer = estimateTransfer(result.requestBodyBytes, result.responseBodyBytes);
-    await updateUsage(
-      update.id,
-      {
-        request_body_bytes: result.requestBodyBytes,
-        response_body_bytes: result.responseBodyBytes,
-        upload_bytes: transfer.uploadBytes,
-        download_bytes: transfer.downloadBytes,
-        total_bytes: transfer.totalBytes,
-      },
-      result.locationSucceeded ? 'success' : 'failed',
-      result.locationError
-    );
-  } catch (error) {
-    const responseBodyBytes = error instanceof ApiError ? error.responseBodyBytes : 0;
     const transfer = estimateTransfer(requestBodyBytes, responseBodyBytes);
-    await updateUsage(
-      update.id,
-      {
-        request_body_bytes: requestBodyBytes,
-        response_body_bytes: responseBodyBytes,
-        upload_bytes: transfer.uploadBytes,
-        download_bytes: transfer.downloadBytes,
-        total_bytes: transfer.totalBytes,
-      },
-      error instanceof ApiError && error.networkFailure ? 'pending' : 'failed',
-      error instanceof Error ? error.message : 'Location upload failed.'
-    );
+    const succeeded = locationSucceeded && usageSucceeded;
+    const errorMessage = errors.length ? errors.join(' · ') : null;
+    await updateUsage(update.id, {
+      request_body_bytes: requestBodyBytes,
+      response_body_bytes: responseBodyBytes,
+      upload_bytes: transfer.uploadBytes,
+      download_bytes: transfer.downloadBytes,
+      total_bytes: transfer.totalBytes,
+    }, succeeded ? 'success' : 'failed', errorMessage);
+    return { succeeded, error: errorMessage };
+  })();
+  locationSyncs.set(update.id, sync);
+  try {
+    return await sync;
+  } finally {
+    if (locationSyncs.get(update.id) === sync) locationSyncs.delete(update.id);
   }
 }
 
-function transmit(update: LocationUpdate): Promise<void> {
-  const inFlight = activeTransmissions.get(update.id);
-  if (inFlight) return inFlight;
-  const request = transmitOnce(update).finally(() => activeTransmissions.delete(update.id));
-  activeTransmissions.set(update.id, request);
-  return request;
+export async function syncPendingLocationUpdates(): Promise<{
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  errors: string[];
+}> {
+  if (!isApiConfigured()) {
+    throw new Error('Set EXPO_PUBLIC_API_URL (or EXPO_PUBLIC_API_BASE_URL) to your laptop Laravel API URL before syncing.');
+  }
+  const pending = await getPendingLocations();
+  const errors: string[] = [];
+  let succeeded = 0;
+  for (const update of pending) {
+    const result = await syncLocationUpdate(update);
+    if (result.succeeded) succeeded += 1;
+    else if (result.error) errors.push(result.error);
+  }
+  return { attempted: pending.length, succeeded, failed: pending.length - succeeded, errors };
 }
 
 export async function recordLocation(
@@ -101,8 +88,8 @@ export async function recordLocation(
 ): Promise<void> {
   const settings = await getSettings();
   const createdAt = timestamp.toISOString();
-  const write = locationWriteQueue.then(async (): Promise<LocationUpdate | null> => {
-    if (await hasLocationTimestamp(createdAt)) return null;
+  const write = locationWriteQueue.then(async () => {
+    if (await hasLocationTimestamp(createdAt)) return;
     const id = Crypto.randomUUID();
     const coordinateBytes = utf8ByteLength(JSON.stringify({
       latitude: coords.latitude,
@@ -121,22 +108,21 @@ export async function recordLocation(
       coordinate_bytes: coordinateBytes,
     };
     await saveLocation(update);
-    return {
-      ...update,
-      request_body_bytes: 0,
-      response_body_bytes: 0,
-      upload_bytes: 0,
-      download_bytes: 0,
-      total_bytes: 0,
-      status: 'pending',
-      error: null,
-    };
+    if (isApiConfigured()) {
+      await syncLocationUpdate({
+        ...update,
+        request_body_bytes: 0,
+        response_body_bytes: 0,
+        upload_bytes: 0,
+        download_bytes: 0,
+        total_bytes: 0,
+        status: 'pending',
+        error: null,
+      });
+    }
   });
   locationWriteQueue = write.then(() => undefined, () => undefined);
-  const locationToTransmit = await write;
-  if (!locationToTransmit) return;
-
-  await transmit(locationToTransmit);
+  await write;
 }
 
 export async function captureCurrentLocation(): Promise<void> {
@@ -158,15 +144,6 @@ export async function captureCurrentLocation(): Promise<void> {
   await recordLocation(location.coords, new Date(location.timestamp));
 }
 
-export async function syncPendingLocations(): Promise<void> {
-  const connectivity = await Network.getNetworkStateAsync();
-  if (!connectivity.isConnected || connectivity.isInternetReachable === false) return;
-  const pending = await getPendingLocations();
-  for (const update of pending) {
-    await transmit(update);
-  }
-}
-
-export async function getLastLocation(): Promise<LocationUpdate | null> {
+export async function getLastLocation() {
   return getLatestLocation();
 }

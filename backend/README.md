@@ -82,9 +82,17 @@ Request:
   "timestamp": "2026-10-11T08:00:00Z",
   "latitude": 10.123456,
   "longitude": 124.123456,
+  "accuracy": 8.5,
+  "altitude": 12.25,
+  "speed": 1.4,
+  "heading": 270,
   "coordinatePayloadBytes": 150
 }
 ```
+
+The GPS measurements are optional and may be `null` when Android has no value. Apply all migrations with `php artisan migrate` to add their nullable columns.
+
+For an Android phone to reach a Laravel server running on the laptop, start Laravel with `php artisan serve --host=0.0.0.0 --port=8000`, put both devices on the same trusted Wi-Fi, and set the Expo app's `EXPO_PUBLIC_API_BASE_URL` to `http://<laptop-wifi-ip>:8000/api`. Do not use `localhost` in the phone's URL.
 
 ### Data usage upload
 

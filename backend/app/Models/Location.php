@@ -17,6 +17,10 @@ class Location extends Model
         'recorded_at',
         'latitude',
         'longitude',
+        'accuracy',
+        'altitude',
+        'speed',
+        'heading',
         'coordinate_payload_bytes',
     ];
 
@@ -24,6 +28,10 @@ class Location extends Model
         'recorded_at' => 'datetime',
         'latitude' => 'float',
         'longitude' => 'float',
+        'accuracy' => 'float',
+        'altitude' => 'float',
+        'speed' => 'float',
+        'heading' => 'float',
     ];
 
     public function device()

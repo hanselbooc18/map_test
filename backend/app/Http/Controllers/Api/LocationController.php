@@ -74,6 +74,10 @@ class LocationController extends Controller
                 'latitude' => $request->input('latitude'),
                 'longitude' => $request->input('longitude'),
                 'coordinate_payload_bytes' => (int) $request->input('coordinatePayloadBytes'),
+                'accuracy' => $request->input('accuracy'),
+                'altitude' => $request->input('altitude'),
+                'speed' => $request->input('speed'),
+                'heading' => $request->input('heading'),
             ]);
 
             $payload = [
@@ -152,6 +156,10 @@ class LocationController extends Controller
             'timestamp' => $location->recorded_at->toIso8601String(),
             'latitude' => $location->latitude,
             'longitude' => $location->longitude,
+            'accuracy' => $location->accuracy,
+            'altitude' => $location->altitude,
+            'speed' => $location->speed,
+            'heading' => $location->heading,
             'coordinatePayloadBytes' => $location->coordinate_payload_bytes,
             'createdAt' => $location->created_at?->toIso8601String(),
             'updatedAt' => $location->updated_at?->toIso8601String(),

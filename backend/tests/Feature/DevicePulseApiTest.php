@@ -96,13 +96,21 @@ class DevicePulseApiTest extends TestCase
             'latitude' => 10.123456,
             'longitude' => 124.123456,
             'coordinatePayloadBytes' => 150,
+            'accuracy' => 8.5,
+            'altitude' => 12.25,
+            'speed' => 1.4,
+            'heading' => 270,
         ];
 
         $this->withHeader('Authorization', 'Bearer token-301')
             ->withHeader('Idempotency-Key', '673d9d13-0d23-4f3b-9a46-9b9c497b62d8')
             ->postJson('/api/locations', $payload)
             ->assertStatus(201)
-            ->assertJsonPath('success', true);
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.accuracy', 8.5)
+            ->assertJsonPath('data.altitude', 12.25)
+            ->assertJsonPath('data.speed', 1.4)
+            ->assertJsonPath('data.heading', 270);
 
         $this->withHeader('Authorization', 'Bearer token-301')
             ->withHeader('Idempotency-Key', '673d9d13-0d23-4f3b-9a46-9b9c497b62d8')
@@ -111,6 +119,14 @@ class DevicePulseApiTest extends TestCase
             ->assertJsonPath('success', true);
 
         $this->assertSame(1, Location::query()->where('device_id', $device->id)->count());
+        $this->assertDatabaseHas('locations', [
+            'device_id' => $device->id,
+            'update_id' => $payload['updateId'],
+            'accuracy' => 8.5,
+            'altitude' => 12.25,
+            'speed' => 1.4,
+            'heading' => 270,
+        ]);
     }
 
     public function test_device_cannot_submit_location_for_another_device(): void
