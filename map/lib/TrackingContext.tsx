@@ -259,7 +259,13 @@ export function TrackingProvider({ children }: React.PropsWithChildren) {
   const disableTracking = useCallback(() => perform(async () => {
     await stopBackgroundLocationUpdates();
     await setSetting('enabled', 'false');
-  }), [perform]);
+    if (backendConfigured) {
+      const result = await syncPendingLocationUpdates();
+      if (result.failed > 0) {
+        setError(result.errors[0] ?? `${result.failed} location update(s) remain unsynced. Retry from Settings when the API is reachable.`);
+      }
+    }
+  }), [backendConfigured, perform]);
 
   const captureNow = useCallback(() => perform(captureCurrentLocation), [perform]);
   const clearError = useCallback(() => setError(null), []);
