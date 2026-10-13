@@ -53,7 +53,7 @@ npx expo start --dev-client
 
 If the app reports that `RNCWebViewModule` is missing, the installed development build predates WebView support. Rebuild and reinstall it using `npx expo run:android`; restarting Metro alone does not add native modules to an already-installed binary.
 
-On the phone, enable Android Location, open the **GPS Test** tab, tap **Start Tracking**, and grant foreground and background location access. The screen requests background updates every 10 seconds and shows the actual reported accuracy and timestamp. Screen recording can continue while moving; Android may defer fixes because of GPS reception, power management, or permission settings.
+On the phone, enable Android Location, open the **GPS Test** tab, tap **Start Tracking**, and grant foreground and background location access. The app requests location updates every 5 seconds and shows the actual reported accuracy and GPS fix timestamp. Screen recording can continue while moving; Android may defer fixes because of GPS reception, power management, or permission settings.
 
 ## Map and connectivity behavior
 

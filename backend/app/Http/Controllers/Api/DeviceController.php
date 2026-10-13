@@ -13,7 +13,7 @@ class DeviceController extends Controller
 {
     public function register(RegisterDeviceRequest $request): JsonResponse
     {
-        $requiredCode = env('DEVICEPULSE_ENROLLMENT_CODE');
+        $requiredCode = config('devicepulse.enrollment_code');
 
         if (filled($requiredCode) && (! $request->filled('enrollmentCode') || $request->input('enrollmentCode') !== $requiredCode)) {
             return response()->json([

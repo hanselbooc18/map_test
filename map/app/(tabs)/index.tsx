@@ -69,9 +69,11 @@ export default function TrackingScreen() {
       <Card style={styles.mapCard}>
         <OpenStreetMap
           fix={latest ? {
+            id: latest.id,
             latitude: latest.latitude,
             longitude: latest.longitude,
             accuracy: latest.accuracy,
+            timestamp: latest.created_at,
           } : null}
         />
       </Card>
@@ -86,7 +88,12 @@ export default function TrackingScreen() {
           <GpsValue label="GPS ACCURACY" value={
             latest?.accuracy == null ? 'Not available' : `±${latest.accuracy.toFixed(1)} m`
           } />
-          <GpsValue label="FIX TIMESTAMP" value={formatTimestamp(latest?.created_at)} />
+          <GpsValue label="GPS FIX" value={formatTimestamp(latest?.created_at)} />
+        </View>
+        <View style={styles.divider} />
+        <View style={styles.coordinateRow}>
+          <GpsValue label="PHONE UPLOAD" value={formatTimestamp(latest?.uploaded_at)} />
+          <GpsValue label="SERVER RECEIVED" value={formatTimestamp(latest?.server_received_at)} />
         </View>
         <View style={styles.divider} />
         <View style={styles.coordinateRow}>
@@ -111,7 +118,7 @@ export default function TrackingScreen() {
         }}
         disabled={busy}
       />
-      <Text style={styles.attributionNote}>Map data © OpenStreetMap contributors · GPS update requested every 10 seconds</Text>
+      <Text style={styles.attributionNote}>Map data © OpenStreetMap contributors · GPS updates requested every 5 seconds when available</Text>
     </Screen>
   );
 }

@@ -15,6 +15,9 @@ class Location extends Model
         'device_id',
         'update_id',
         'recorded_at',
+        'gps_fix_at',
+        'uploaded_at',
+        'server_received_at',
         'latitude',
         'longitude',
         'accuracy',
@@ -26,6 +29,9 @@ class Location extends Model
 
     protected $casts = [
         'recorded_at' => 'datetime',
+        'gps_fix_at' => 'datetime',
+        'uploaded_at' => 'datetime',
+        'server_received_at' => 'datetime',
         'latitude' => 'float',
         'longitude' => 'float',
         'accuracy' => 'float',

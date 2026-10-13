@@ -30,6 +30,11 @@ class DevicePulseApiTest extends TestCase
         ];
     }
 
+    protected function currentFixTimestamp(int $secondsAgo = 0): string
+    {
+        return now()->subSeconds($secondsAgo)->toIso8601String();
+    }
+
     public function test_device_registration_returns_access_token(): void
     {
         $result = $this->registerDevice();
@@ -92,7 +97,8 @@ class DevicePulseApiTest extends TestCase
         $payload = [
             'updateId' => '673d9d13-0d23-4f3b-9a46-9b9c497b62d8',
             'deviceId' => 'device-301',
-            'timestamp' => '2026-10-11T08:00:00Z',
+            'timestamp' => $this->currentFixTimestamp(),
+            'uploadedAt' => now()->toIso8601String(),
             'latitude' => 10.123456,
             'longitude' => 124.123456,
             'coordinatePayloadBytes' => 150,
@@ -102,11 +108,14 @@ class DevicePulseApiTest extends TestCase
             'heading' => 270,
         ];
 
+        $retryPayload = $payload;
+        $retryPayload['uploadedAt'] = now()->addSeconds(3)->toIso8601String();
         $this->withHeader('Authorization', 'Bearer token-301')
             ->withHeader('Idempotency-Key', '673d9d13-0d23-4f3b-9a46-9b9c497b62d8')
             ->postJson('/api/locations', $payload)
             ->assertStatus(201)
             ->assertJsonPath('success', true)
+            ->assertJsonStructure(['data' => ['gpsFixAt', 'uploadedAt', 'serverReceivedAt']])
             ->assertJsonPath('data.accuracy', 8.5)
             ->assertJsonPath('data.altitude', 12.25)
             ->assertJsonPath('data.speed', 1.4)
@@ -114,7 +123,7 @@ class DevicePulseApiTest extends TestCase
 
         $this->withHeader('Authorization', 'Bearer token-301')
             ->withHeader('Idempotency-Key', '673d9d13-0d23-4f3b-9a46-9b9c497b62d8')
-            ->postJson('/api/locations', $payload)
+            ->postJson('/api/locations', $retryPayload)
             ->assertStatus(200)
             ->assertJsonPath('success', true);
 
@@ -127,6 +136,87 @@ class DevicePulseApiTest extends TestCase
             'speed' => 1.4,
             'heading' => 270,
         ]);
+    }
+
+    public function test_out_of_order_and_delayed_location_fixes_are_all_saved_once(): void
+    {
+        $device = Device::factory()->create([
+            'device_id' => 'device-order',
+            'enrollment_status' => 'active',
+            'token_hash' => Hash::make('order-token'),
+        ]);
+
+        $headers = ['Authorization' => 'Bearer order-token'];
+        $latestId = '673d9d13-0d23-4f3b-9a46-9b9c497b62d8';
+        $this->withHeaders($headers)->withHeader('Idempotency-Key', $latestId)
+            ->postJson('/api/locations', [
+                'updateId' => $latestId,
+                'deviceId' => 'device-order',
+                'timestamp' => $this->currentFixTimestamp(),
+                'uploadedAt' => now()->toIso8601String(),
+                'latitude' => 10,
+                'longitude' => 124,
+                'coordinatePayloadBytes' => 10,
+            ])->assertCreated()->assertJsonPath('accepted', true);
+
+        $oldId = '773d9d13-0d23-4f3b-9a46-9b9c497b62d8';
+        $this->withHeaders($headers)->withHeader('Idempotency-Key', $oldId)
+            ->postJson('/api/locations', [
+                'updateId' => $oldId,
+                'deviceId' => 'device-order',
+                'timestamp' => $this->currentFixTimestamp(60),
+                'uploadedAt' => now()->toIso8601String(),
+                'latitude' => 11,
+                'longitude' => 125,
+                'coordinatePayloadBytes' => 10,
+            ])->assertCreated()->assertJsonPath('accepted', true);
+
+        $staleId = '873d9d13-0d23-4f3b-9a46-9b9c497b62d8';
+        $this->withHeaders($headers)->withHeader('Idempotency-Key', $staleId)
+            ->postJson('/api/locations', [
+                'updateId' => $staleId,
+                'deviceId' => 'device-order',
+                'timestamp' => now()->subMinutes(2)->toIso8601String(),
+                'latitude' => 12,
+                'longitude' => 126,
+                'coordinatePayloadBytes' => 10,
+            ])->assertCreated()->assertJsonPath('accepted', true);
+
+        $this->withHeader('Authorization', 'Bearer order-token')
+            ->getJson('/api/devices/device-order/locations/latest')
+            ->assertOk()->assertJsonPath('data.latitude', 10);
+        $sameCoordinatesId = '973d9d13-0d23-4f3b-9a46-9b9c497b62d8';
+        $this->withHeaders($headers)->withHeader('Idempotency-Key', $sameCoordinatesId)
+            ->postJson('/api/locations', [
+                'updateId' => $sameCoordinatesId,
+                'deviceId' => 'device-order',
+                'timestamp' => $this->currentFixTimestamp(180),
+                'latitude' => 10,
+                'longitude' => 124,
+                'coordinatePayloadBytes' => 10,
+                'accuracy' => 68.1,
+            ])->assertCreated()->assertJsonPath('accepted', true);
+        $this->assertSame(4, Location::query()->where('device_id', $device->id)->count());
+        $this->assertSame(4, Location::query()->where('device_id', $device->id)->distinct('update_id')->count('update_id'));
+        $this->assertDatabaseHas('locations', ['device_id' => $device->id, 'update_id' => $sameCoordinatesId, 'accuracy' => 68.1]);
+    }
+
+    public function test_authenticated_location_route_keeps_its_rate_limit(): void
+    {
+        $device = Device::factory()->create([
+            'device_id' => 'device-limited',
+            'enrollment_status' => 'active',
+            'token_hash' => Hash::make('limited-token'),
+        ]);
+
+        for ($attempt = 0; $attempt < 60; $attempt++) {
+            $this->withHeader('Authorization', 'Bearer limited-token')
+                ->getJson('/api/devices/'.$device->device_id.'/locations/latest');
+        }
+
+        $this->withHeader('Authorization', 'Bearer limited-token')
+            ->getJson('/api/devices/'.$device->device_id.'/locations/latest')
+            ->assertStatus(429);
     }
 
     public function test_device_cannot_submit_location_for_another_device(): void

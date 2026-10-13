@@ -9,10 +9,13 @@ const API_BASE_URL = (
 )?.trim().replace(/\/+$/, '');
 const TOKEN_KEY = 'tracking-api-token';
 const ENROLLMENT_CODE_KEY = 'tracking-enrollment-code';
+const REGISTRATION_RETRY_DELAY_MS = 60_000;
 const ESTIMATED_REQUEST_HEADERS_BYTES = 520;
 const ESTIMATED_RESPONSE_HEADERS_BYTES = 280;
 const MIN_API_REQUEST_INTERVAL_MS = 1100;
 let tokenRefresh: Promise<string> | null = null;
+let registrationRetryUntil = 0;
+let registrationRetryStatus: number | undefined;
 let requestQueue: Promise<void> = Promise.resolve();
 let nextRequestAllowedAt = 0;
 
@@ -23,7 +26,8 @@ export class ApiError extends Error {
     public readonly requestBodyBytes = 0,
     public readonly networkFailure = false,
     public readonly statusCode?: number,
-    public readonly responseMessage?: string
+    public readonly responseMessage?: string,
+    public readonly retryAfterMs?: number
   ) {
     super(message);
     this.name = 'ApiError';
@@ -45,6 +49,8 @@ export async function saveEnrollmentCode(code: string): Promise<void> {
   } else {
     await SecureStore.deleteItemAsync(ENROLLMENT_CODE_KEY);
   }
+  registrationRetryUntil = 0;
+  registrationRetryStatus = undefined;
 }
 
 function requireBaseUrl(): string {
@@ -71,7 +77,7 @@ function networkError(error: unknown, requestBodyBytes = 0): ApiError {
   return new ApiError(message, 0, requestBodyBytes, true);
 }
 
-function httpError(statusCode: number, text: string, requestBodyBytes = 0): ApiError {
+function httpError(statusCode: number, text: string, requestBodyBytes = 0, retryAfterHeader?: string | null): ApiError {
   let payload: { message?: unknown; errors?: Record<string, unknown> } = {};
   try {
     payload = JSON.parse(text) as typeof payload;
@@ -86,13 +92,21 @@ function httpError(statusCode: number, text: string, requestBodyBytes = 0): ApiE
     ? validationMessages.join(' ')
     : responseMessage ?? (text ? text.slice(0, 180) : '');
   const suffix = detail ? `: ${detail}` : '';
-  const message = statusCode === 422
+  const message = statusCode === 403
+    && responseMessage === 'A valid enrollment code is required to register this device.'
+    ? 'Device enrollment failed (HTTP 403). Enter the server code in Settings → Laravel / MySQL sync, then save it and retry.'
+    : statusCode === 422
     ? `Laravel validation failed (HTTP 422)${suffix}`
     : statusCode === 401 || statusCode === 403
       ? `Laravel authentication/authorization failed (HTTP ${statusCode})${suffix}`
       : `Laravel API returned HTTP ${statusCode}${suffix}`;
 
-  return new ApiError(message, utf8ByteLength(text), requestBodyBytes, false, statusCode, responseMessage);
+  const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+  const retryAfterDate = retryAfterHeader ? Date.parse(retryAfterHeader) : NaN;
+  const retryAfterMs = Number.isFinite(retryAfterSeconds)
+    ? Math.max(1000, retryAfterSeconds * 1000)
+    : Number.isFinite(retryAfterDate) ? Math.max(1000, retryAfterDate - Date.now()) : undefined;
+  return new ApiError(message, utf8ByteLength(text), requestBodyBytes, false, statusCode, responseMessage, retryAfterMs);
 }
 
 async function fetchWithNetworkHandling(url: string, options: RequestInit): Promise<Response> {
@@ -119,15 +133,25 @@ async function waitForApiRequestSlot(): Promise<void> {
 
 async function sendJson<T>(
   path: string,
-  body: unknown,
-  options: { token?: string; idempotencyKey?: string } = {}
-): Promise<{ value: T; requestBodyBytes: number; responseBodyBytes: number }> {
+  body: unknown | ((uploadedAt: string) => unknown),
+  options: { token?: string; idempotencyKey?: string; onUploadTimestamp?: (timestamp: string) => Promise<void> } = {}
+): Promise<{ value: T; requestBodyBytes: number; responseBodyBytes: number; uploadedAt: string }> {
   const url = `${requireBaseUrl()}${path}`;
-  const serialized = JSON.stringify(body);
-  const requestBodyBytes = utf8ByteLength(serialized);
+  let serialized = '';
+  let requestBodyBytes = 0;
+  let uploadedAt = '';
   let response: Response;
   try {
     await waitForApiRequestSlot();
+    const requestStartedAt = new Date().toISOString();
+    const bodyValue = typeof body === 'function' ? body(requestStartedAt) : body;
+    const stableUploadTimestamp = typeof bodyValue === 'object' && bodyValue !== null && 'uploadedAt' in bodyValue
+      ? (bodyValue as { uploadedAt?: unknown }).uploadedAt
+      : null;
+    uploadedAt = typeof stableUploadTimestamp === 'string' ? stableUploadTimestamp : requestStartedAt;
+    await options.onUploadTimestamp?.(uploadedAt);
+    serialized = JSON.stringify(bodyValue);
+    requestBodyBytes = utf8ByteLength(serialized);
     response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -143,7 +167,7 @@ async function sendJson<T>(
   const text = await response.text();
   const responseBodyBytes = utf8ByteLength(text);
   if (!response.ok) {
-    throw httpError(response.status, text, requestBodyBytes);
+    throw httpError(response.status, text, requestBodyBytes, response.headers.get('Retry-After'));
   }
   let value: T;
   try {
@@ -151,7 +175,7 @@ async function sendJson<T>(
   } catch {
     throw new ApiError('The backend returned an invalid JSON response.', responseBodyBytes, requestBodyBytes);
   }
-  return { value, requestBodyBytes, responseBodyBytes };
+  return { value, requestBodyBytes, responseBodyBytes, uploadedAt };
 }
 
 async function getJson<T>(path: string, token: string): Promise<T> {
@@ -161,7 +185,7 @@ async function getJson<T>(path: string, token: string): Promise<T> {
   });
   const text = await response.text();
   if (!response.ok) {
-    throw httpError(response.status, text);
+    throw httpError(response.status, text, 0, response.headers.get('Retry-After'));
   }
   try {
     return text ? (JSON.parse(text) as T) : ({} as T);
@@ -173,13 +197,34 @@ async function getJson<T>(path: string, token: string): Promise<T> {
 async function registerDevice(settings: TrackingSettings): Promise<string> {
   const existing = await SecureStore.getItemAsync(TOKEN_KEY);
   if (existing) return existing;
+  if (Date.now() < registrationRetryUntil) {
+    const retryMessage = registrationRetryStatus === 403
+      ? 'Device registration is paused after the server rejected the enrollment code. Save the correct server code in Settings, then try again.'
+      : 'Device registration is paused after a rate limit. Wait a minute before trying again.';
+    throw new ApiError(
+      retryMessage,
+      0,
+      0,
+      false,
+      registrationRetryStatus
+    );
+  }
   const enrollmentCode = await getEnrollmentCode();
-  const { value } = await sendJson<{ accessToken?: string }>('/devices/register', {
-    deviceId: settings.deviceId,
-    deviceName: settings.deviceName,
-    platform: Platform.OS === 'ios' ? 'ios' : Platform.OS === 'web' ? 'web' : 'android',
-    ...(enrollmentCode ? { enrollmentCode } : {}),
-  });
+  let value: { accessToken?: string };
+  try {
+    ({ value } = await sendJson<{ accessToken?: string }>('/devices/register', {
+      deviceId: settings.deviceId,
+      deviceName: settings.deviceName,
+      platform: Platform.OS === 'ios' ? 'ios' : Platform.OS === 'web' ? 'web' : 'android',
+      ...(enrollmentCode ? { enrollmentCode } : {}),
+    }));
+  } catch (error) {
+    if (error instanceof ApiError && (error.statusCode === 403 || error.statusCode === 429)) {
+      registrationRetryUntil = Date.now() + REGISTRATION_RETRY_DELAY_MS;
+      registrationRetryStatus = error.statusCode;
+    }
+    throw error;
+  }
   if (!value.accessToken) {
     throw new ApiError('Device registration response did not include an accessToken.');
   }
@@ -208,15 +253,16 @@ async function sendAuthenticatedJson<T>(
   settings: TrackingSettings,
   path: string,
   body: unknown,
-  idempotencyKey: string
-): Promise<{ value: T; requestBodyBytes: number; responseBodyBytes: number }> {
+  idempotencyKey: string,
+  onUploadTimestamp?: (timestamp: string) => Promise<void>
+): Promise<{ value: T; requestBodyBytes: number; responseBodyBytes: number; uploadedAt: string }> {
   let token = await registerDevice(settings);
   try {
-    return await sendJson<T>(path, body, { token, idempotencyKey });
+    return await sendJson<T>(path, body, { token, idempotencyKey, onUploadTimestamp });
   } catch (error) {
     if (!(error instanceof ApiError) || error.statusCode !== 401) throw error;
     token = await refreshDeviceToken(settings, token);
-    return sendJson<T>(path, body, { token, idempotencyKey });
+    return sendJson<T>(path, body, { token, idempotencyKey, onUploadTimestamp });
   }
 }
 
@@ -233,7 +279,8 @@ async function getAuthenticatedJson<T>(settings: TrackingSettings, path: string)
 
 export async function submitLocation(
   settings: TrackingSettings,
-  update: LocationUpdate
+  update: LocationUpdate,
+  onUploadTimestamp?: (timestamp: string) => Promise<void>
 ): Promise<{
   requestBodyBytes: number;
   responseBodyBytes: number;
@@ -241,6 +288,11 @@ export async function submitLocation(
   locationError: string | null;
   usageSucceeded: boolean;
   usageError: string | null;
+  stopSync: boolean;
+  uploadedAt: string | null;
+  serverReceivedAt: string | null;
+  retryable: boolean;
+  retryAfterMs: number | null;
 }> {
   let requestBodyBytes = 0;
   let responseBodyBytes = 0;
@@ -248,14 +300,20 @@ export async function submitLocation(
   let locationError: string | null = null;
   let usageSucceeded = false;
   let usageError: string | null = null;
+  let stopSync = false;
+  let uploadedAt: string | null = null;
+  let serverReceivedAt: string | null = null;
+  let retryable = false;
+  let retryAfterMs: number | null = null;
   try {
     const locationResult = await sendAuthenticatedJson(
       settings,
       '/locations',
-      {
+      (uploadTimestamp: string) => ({
         updateId: update.id,
         deviceId: update.device_id,
         timestamp: update.created_at,
+        uploadedAt: update.uploaded_at ?? uploadTimestamp,
         latitude: update.latitude,
         longitude: update.longitude,
         coordinatePayloadBytes: update.coordinate_bytes,
@@ -263,28 +321,49 @@ export async function submitLocation(
         altitude: update.altitude,
         speed: update.speed,
         heading: update.heading,
-      },
-      update.id
+      }),
+      update.id,
+      async (uploadTimestamp) => {
+        update.uploaded_at = update.uploaded_at ?? uploadTimestamp;
+        await onUploadTimestamp?.(update.uploaded_at);
+      }
     );
     requestBodyBytes += locationResult.requestBodyBytes;
     responseBodyBytes += locationResult.responseBodyBytes;
+    uploadedAt = locationResult.uploadedAt;
+    const responseValue = locationResult.value as {
+      success?: boolean;
+      accepted?: boolean;
+      data?: { updateId?: string; uploadedAt?: string | null; serverReceivedAt?: string | null };
+    };
+    const data = responseValue.data;
+    if (responseValue.success !== true || responseValue.accepted === false || data?.updateId !== update.id) {
+      throw new ApiError('Laravel did not confirm this GPS fix was saved.', locationResult.responseBodyBytes, locationResult.requestBodyBytes, false, 502);
+    }
+    uploadedAt = data.uploadedAt ?? locationResult.uploadedAt;
+    serverReceivedAt = data?.serverReceivedAt ?? null;
     locationSucceeded = true;
   } catch (error) {
     locationError = error instanceof Error ? error.message : 'Location upload failed.';
     if (error instanceof ApiError) {
       requestBodyBytes += error.requestBodyBytes;
       responseBodyBytes += error.responseBodyBytes;
-      if (error.networkFailure || error.statusCode === 401 || error.statusCode === 429) {
-        return {
-          requestBodyBytes,
-          responseBodyBytes,
-          locationSucceeded,
-          locationError,
-          usageSucceeded,
-          usageError,
-        };
-      }
+      retryable = error.networkFailure || error.statusCode === 429 || (error.statusCode !== undefined && error.statusCode >= 500);
+      retryAfterMs = error.retryAfterMs ?? null;
     }
+    return {
+      requestBodyBytes,
+      responseBodyBytes,
+      locationSucceeded,
+      locationError,
+      usageSucceeded,
+      usageError,
+      stopSync: retryable || (error instanceof ApiError && (error.statusCode === 401 || error.statusCode === 403)),
+      uploadedAt,
+      serverReceivedAt,
+      retryable,
+      retryAfterMs,
+    };
   }
   let usageBody: Record<string, unknown> = {};
   let estimatedRequestBodyBytes = requestBodyBytes;
@@ -325,9 +404,12 @@ export async function submitLocation(
     if (error instanceof ApiError) {
       requestBodyBytes += error.requestBodyBytes;
       responseBodyBytes += error.responseBodyBytes;
+      stopSync = error.networkFailure || error.statusCode === 401 || error.statusCode === 403 || error.statusCode === 429;
+      retryable = error.networkFailure || error.statusCode === 429 || (error.statusCode !== undefined && error.statusCode >= 500);
+      retryAfterMs = error.retryAfterMs ?? null;
     }
   }
-  return { requestBodyBytes, responseBodyBytes, locationSucceeded, locationError, usageSucceeded, usageError };
+  return { requestBodyBytes, responseBodyBytes, locationSucceeded, locationError, usageSucceeded, usageError, stopSync, uploadedAt, serverReceivedAt, retryable, retryAfterMs };
 }
 
 export async function getRemoteLatest(settings: TrackingSettings): Promise<unknown> {
@@ -347,6 +429,28 @@ export async function getRemoteLatest(settings: TrackingSettings): Promise<unkno
 
 export async function getRemoteHistory(settings: TrackingSettings): Promise<unknown> {
   return getAuthenticatedJson(settings, `/devices/${encodeURIComponent(settings.deviceId)}/locations`);
+}
+
+export async function getRemoteLocationIds(settings: TrackingSettings): Promise<string[]> {
+  const ids: string[] = [];
+  let page = 1;
+  let lastPage = 1;
+  do {
+    const result = await getAuthenticatedJson<{
+      items?: { update_id?: unknown; updateId?: unknown }[];
+      pagination?: { lastPage?: number };
+    }>(settings, `/devices/${encodeURIComponent(settings.deviceId)}/locations?limit=100&page=${page}`);
+    if (!Array.isArray(result.items) || !result.pagination) {
+      throw new ApiError('Laravel returned an invalid location reconciliation response.');
+    }
+    for (const item of result.items) {
+      const id = typeof item.update_id === 'string' ? item.update_id : item.updateId;
+      if (typeof id === 'string') ids.push(id);
+    }
+    lastPage = Math.max(1, result.pagination.lastPage ?? 1);
+    page += 1;
+  } while (page <= lastPage);
+  return ids;
 }
 
 export async function getRemoteUsageSummary(settings: TrackingSettings): Promise<unknown> {

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreLocationRequest;
+use App\Models\Device;
 use App\Models\IdempotencyKey;
 use App\Models\Location;
 use Carbon\Carbon;
@@ -33,6 +34,28 @@ class LocationController extends Controller
         }
 
         $requestHash = hash('sha256', $request->getContent());
+        $existingLocation = Location::query()
+            ->where('device_id', $device->id)
+            ->where('update_id', $updateId)
+            ->first();
+
+        if ($existingLocation !== null) {
+            if (! $this->matchesGpsFix($existingLocation, $request)) {
+                return response()->json([
+                    'message' => 'This GPS fix ID is already associated with different location data.',
+                ], 409);
+            }
+
+            $payload = [
+                'success' => true,
+                'accepted' => true,
+                'message' => 'Location was already recorded successfully',
+                'data' => $this->serializeLocation($existingLocation),
+            ];
+            $this->saveIdempotencyResponse($device, 'location', $idempotencyKey, $requestHash, $payload);
+            return response()->json($payload, 200);
+        }
+
         $storedKey = IdempotencyKey::query()
             ->where('device_id', $device->id)
             ->where('resource_type', 'location')
@@ -46,18 +69,30 @@ class LocationController extends Controller
                 ], 409);
             }
 
-            return response()->json($storedKey->response_payload, 200);
+            if (($storedKey->response_payload['accepted'] ?? true) !== false) {
+                return response()->json($storedKey->response_payload, 200);
+            }
         }
 
-        return DB::transaction(function () use ($request, $device, $deviceId, $updateId, $idempotencyKey, $requestHash) {
+        $serverReceivedAt = now();
+
+        return DB::transaction(function () use ($request, $device, $deviceId, $updateId, $idempotencyKey, $requestHash, $serverReceivedAt) {
+            Device::query()->whereKey($device->id)->lockForUpdate()->firstOrFail();
             $existingLocation = Location::query()
                 ->where('device_id', $device->id)
                 ->where('update_id', $updateId)
                 ->first();
 
             if ($existingLocation !== null) {
+                if (! $this->matchesGpsFix($existingLocation, $request)) {
+                    return response()->json([
+                        'message' => 'This GPS fix ID is already associated with different location data.',
+                    ], 409);
+                }
+
                 $payload = [
                     'success' => true,
+                    'accepted' => true,
                     'message' => 'Location recorded successfully',
                     'data' => $this->serializeLocation($existingLocation),
                 ];
@@ -67,10 +102,14 @@ class LocationController extends Controller
                 return response()->json($payload, 200);
             }
 
+            $gpsFixAt = Carbon::parse($request->input('timestamp'));
             $location = Location::query()->create([
                 'device_id' => $device->id,
                 'update_id' => $updateId,
                 'recorded_at' => $request->input('timestamp'),
+                'gps_fix_at' => $gpsFixAt,
+                'uploaded_at' => $request->input('uploadedAt'),
+                'server_received_at' => $serverReceivedAt,
                 'latitude' => $request->input('latitude'),
                 'longitude' => $request->input('longitude'),
                 'coordinate_payload_bytes' => (int) $request->input('coordinatePayloadBytes'),
@@ -82,6 +121,7 @@ class LocationController extends Controller
 
             $payload = [
                 'success' => true,
+                'accepted' => true,
                 'message' => 'Location recorded successfully',
                 'data' => $this->serializeLocation($location),
             ];
@@ -104,6 +144,7 @@ class LocationController extends Controller
 
         $location = Location::query()
             ->where('device_id', $device->id)
+            ->orderByDesc('gps_fix_at')
             ->orderByDesc('recorded_at')
             ->first();
 
@@ -134,7 +175,7 @@ class LocationController extends Controller
             ->when($request->filled('to'), fn ($query) => $query->where('recorded_at', '<=', Carbon::parse($request->query('to'))->format('Y-m-d H:i:s')));
 
         $perPage = min(max((int) $request->query('limit', 25), 1), 100);
-        $items = $query->orderByDesc('recorded_at')->paginate($perPage, ['*'], 'page', max((int) $request->query('page', 1), 1));
+        $items = $query->orderByDesc('gps_fix_at')->orderByDesc('recorded_at')->paginate($perPage, ['*'], 'page', max((int) $request->query('page', 1), 1));
 
         return response()->json([
             'items' => $items->items(),
@@ -154,6 +195,9 @@ class LocationController extends Controller
             'updateId' => $location->update_id,
             'deviceId' => $location->device->device_id,
             'timestamp' => $location->recorded_at->toIso8601String(),
+            'gpsFixAt' => ($location->gps_fix_at ?? $location->recorded_at)->toIso8601String(),
+            'uploadedAt' => $location->uploaded_at?->toIso8601String(),
+            'serverReceivedAt' => $location->server_received_at?->toIso8601String(),
             'latitude' => $location->latitude,
             'longitude' => $location->longitude,
             'accuracy' => $location->accuracy,
@@ -164,6 +208,32 @@ class LocationController extends Controller
             'createdAt' => $location->created_at?->toIso8601String(),
             'updatedAt' => $location->updated_at?->toIso8601String(),
         ];
+    }
+
+    protected function matchesGpsFix(Location $location, StoreLocationRequest $request): bool
+    {
+        $storedTimestamp = $location->gps_fix_at ?? $location->recorded_at;
+        $requestTimestamp = Carbon::parse($request->input('timestamp'));
+        $timestampsMatch = $location->gps_fix_at !== null
+            ? $storedTimestamp->equalTo($requestTimestamp)
+            : abs($storedTimestamp->getTimestamp() - $requestTimestamp->getTimestamp()) <= 1;
+
+        return $timestampsMatch
+            && round((float) $location->latitude, 8) === round((float) $request->input('latitude'), 8)
+            && round((float) $location->longitude, 8) === round((float) $request->input('longitude'), 8)
+            && $this->matchesOptionalMeasurement($location->accuracy, $request->input('accuracy'), 2)
+            && $this->matchesOptionalMeasurement($location->altitude, $request->input('altitude'), 2)
+            && $this->matchesOptionalMeasurement($location->speed, $request->input('speed'), 2)
+            && $this->matchesOptionalMeasurement($location->heading, $request->input('heading'), 2);
+    }
+
+    protected function matchesOptionalMeasurement(?float $stored, mixed $submitted, int $precision): bool
+    {
+        if ($stored === null || $submitted === null) {
+            return $stored === null && $submitted === null;
+        }
+
+        return round($stored, $precision) === round((float) $submitted, $precision);
     }
 
     protected function saveIdempotencyResponse($device, string $resourceType, string $idempotencyKey, string $requestHash, array $payload): void

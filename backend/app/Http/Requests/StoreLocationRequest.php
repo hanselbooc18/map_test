@@ -17,6 +17,7 @@ class StoreLocationRequest extends FormRequest
             'updateId' => ['required', 'uuid'],
             'deviceId' => ['required', 'string', 'max:255'],
             'timestamp' => ['required', 'date'],
+            'uploadedAt' => ['nullable', 'date'],
             'latitude' => ['required', 'numeric', 'between:-90,90'],
             'longitude' => ['required', 'numeric', 'between:-180,180'],
             'coordinatePayloadBytes' => ['required', 'integer', 'min:0'],

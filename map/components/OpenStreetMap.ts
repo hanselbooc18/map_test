@@ -6,9 +6,11 @@ import type { WebViewMessageEvent } from 'react-native-webview';
 import { palette } from './mobile-ui';
 
 type GpsFix = {
+  id: string;
   latitude: number;
   longitude: number;
   accuracy: number | null;
+  timestamp: string;
 };
 
 const mapHtml = `<!doctype html>
@@ -38,7 +40,14 @@ const mapHtml = `<!doctype html>
       }).addTo(map);
       let marker = null;
       let accuracyCircle = null;
-      window.updateGpsFix = function(latitude, longitude, accuracy) {
+      let newestFixTimestamp = 0;
+      let newestFixId = null;
+      window.updateGpsFix = function(latitude, longitude, accuracy, timestamp, fixId) {
+        const fixTimestamp = Date.parse(timestamp);
+        if (!Number.isFinite(fixTimestamp) || fixTimestamp < newestFixTimestamp
+          || (fixTimestamp === newestFixTimestamp && fixId === newestFixId)) return;
+        newestFixTimestamp = fixTimestamp;
+        newestFixId = fixId;
         const point = [latitude, longitude];
         const hasAccuracy = typeof accuracy === 'number' && Number.isFinite(accuracy) && accuracy > 0;
         if (!marker) {
@@ -65,7 +74,7 @@ const mapHtml = `<!doctype html>
             accuracyCircle = null;
           }
         }
-        map.setView(point, Math.max(map.getZoom(), 16), { animate: true });
+        map.setView(point, Math.max(map.getZoom(), 16), { animate: false });
         document.getElementById('waiting').style.display = 'none';
       };
       window.ReactNativeWebView.postMessage('MAP_READY');
@@ -97,9 +106,11 @@ export function OpenStreetMap({ fix }: { fix: GpsFix | null }) {
   useEffect(() => {
     if (!mapReady || !fix) return;
     const accuracy = fix.accuracy;
-    const script = `window.updateGpsFix(${fix.latitude},${fix.longitude},${accuracy}); true;`;
+    const timestamp = JSON.stringify(fix.timestamp);
+    const fixId = JSON.stringify(fix.id);
+    const script = `window.updateGpsFix(${fix.latitude},${fix.longitude},${accuracy},${timestamp},${fixId}); true;`;
     webView.current?.injectJavaScript(script);
-  }, [fix?.latitude, fix?.longitude, fix?.accuracy, mapReady]);
+  }, [fix?.id, fix?.latitude, fix?.longitude, fix?.accuracy, fix?.timestamp, mapReady]);
 
   const handleMessage = (event: WebViewMessageEvent) => {
     if (event.nativeEvent.data === 'MAP_READY') setMapReady(true);

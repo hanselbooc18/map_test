@@ -12,13 +12,18 @@ function permissionLabel(status: string): string {
 export default function SettingsScreen() {
   const {
     settings, locations, permissions, online, busy, error, backendConfigured,
-    enableTracking, disableTracking, syncPending, clearError,
+    enableTracking, disableTracking, syncPending, reconcile, clearError,
   } = useTracking();
   const [enrollmentCode, setEnrollmentCode] = useState('');
   const [hasEnrollmentCode, setHasEnrollmentCode] = useState(false);
   const [savingCode, setSavingCode] = useState(false);
   const [codeMessage, setCodeMessage] = useState<string | null>(null);
-  const pendingCount = locations.filter((location) => location.status !== 'success').length;
+  const [reconciliationMessage, setReconciliationMessage] = useState<string | null>(null);
+  const recordedCount = locations.length;
+  const pendingCount = locations.filter((location) => location.server_saved === 0 && location.status === 'pending').length;
+  const confirmedCount = locations.filter((location) => location.server_saved === 1).length;
+  const failedCount = locations.filter((location) => location.server_saved === 0 && location.status === 'failed').length;
+  const retryCount = pendingCount + failedCount;
 
   useEffect(() => {
     getEnrollmentCode()
@@ -60,9 +65,9 @@ export default function SettingsScreen() {
         <Label>LOCATION REPORTING INTERVAL</Label>
         <View style={styles.intervalRow}>
           <Text style={styles.intervalLabel}>GPS request interval</Text>
-          <Text style={styles.intervalValue}>10 sec</Text>
+          <Text style={styles.intervalValue}>5 sec target</Text>
         </View>
-        <Text style={styles.body}>GPS fixes are requested every 10 seconds while tracking. Android and iOS may defer background delivery to protect battery or when GPS reception is limited.</Text>
+        <Text style={styles.body}>A continuous GPS subscription requests fixes at 5-second intervals while tracking. The operating system may delay delivery or provide no new fix when GPS data is unavailable.</Text>
       </Card>
 
       <Card>
@@ -108,15 +113,31 @@ export default function SettingsScreen() {
           </Text>
         </View>
         <Text style={styles.body}>
-          Pending or failed location reports: {pendingCount}. The phone sends data to Laravel; Laravel stores it in MySQL.
+          Recorded locally: {recordedCount}{'\n'}Waiting to upload: {pendingCount}{'\n'}Confirmed saved by Laravel: {confirmedCount}{'\n'}Failed uploads: {failedCount}
+        </Text>
+        <Text style={styles.body}>
+          A record counts as confirmed only after Laravel replies with the matching GPS fix ID. The phone sends data to Laravel; Laravel stores it in MySQL.
           The phone must be on the same Wi-Fi as your laptop, and the API URL must use the laptop's LAN IP, not localhost.
         </Text>
         <Button
-          title={`Sync pending reports (${pendingCount})`}
+          title={`Sync pending/failed reports (${retryCount})`}
           secondary
-          disabled={busy || pendingCount === 0}
+          disabled={busy || retryCount === 0}
           onPress={() => { void syncPending().catch(() => undefined); }}
         />
+        <Button
+          title="Reconcile local IDs with Laravel"
+          secondary
+          disabled={busy || !backendConfigured}
+          onPress={() => {
+            void reconcile().then((result) => {
+              setReconciliationMessage(
+                `Matched ${result.matchedCount} IDs (${result.localCount} local, ${result.serverCount} on server); ${result.missingOnServer} local records missing on server, ${result.missingLocally} server records missing locally.`
+              );
+            }).catch(() => setReconciliationMessage('Reconciliation failed. Check the API connection and retry.'));
+          }}
+        />
+        {reconciliationMessage ? <Text style={styles.body}>{reconciliationMessage}</Text> : null}
         <Label>ENROLLMENT CODE (IF REQUIRED BY YOUR SERVER)</Label>
         <TextInput
           value={enrollmentCode}
@@ -155,7 +176,7 @@ export default function SettingsScreen() {
 
       {error ? <Notice tone="error">{error}</Notice> : null}
       {error ? <Button title="Dismiss message" secondary onPress={clearError} /> : null}
-      <Text style={styles.footer}>Background updates are requested every 10 seconds. Android may defer fixes because of GPS reception, permissions, or battery restrictions.</Text>
+      <Text style={styles.footer}>Five seconds is the requested interval. Actual GPS delivery may vary with signal, permissions, network, and operating-system background limits.</Text>
     </Screen>
   );
 }

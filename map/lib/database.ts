@@ -21,7 +21,10 @@ export async function getDatabase() {
         CREATE TABLE IF NOT EXISTS location_updates (
           id TEXT PRIMARY KEY NOT NULL,
           device_id TEXT NOT NULL,
+          fix_key TEXT,
           created_at TEXT NOT NULL,
+          uploaded_at TEXT,
+          server_received_at TEXT,
           latitude REAL NOT NULL,
           longitude REAL NOT NULL,
           accuracy REAL,
@@ -35,7 +38,8 @@ export async function getDatabase() {
           download_bytes INTEGER NOT NULL DEFAULT 0,
           total_bytes INTEGER NOT NULL DEFAULT 0,
           status TEXT NOT NULL,
-          error TEXT
+          error TEXT,
+          server_saved INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS location_updates_created_at
           ON location_updates(created_at DESC);
@@ -51,6 +55,19 @@ export async function getDatabase() {
           await database.execAsync(`ALTER TABLE location_updates ADD COLUMN ${column} REAL`);
         }
       }
+      for (const column of ['uploaded_at', 'server_received_at'] as const) {
+        if (!existingColumns.has(column)) {
+          await database.execAsync(`ALTER TABLE location_updates ADD COLUMN ${column} TEXT`);
+        }
+      }
+      if (!existingColumns.has('server_saved')) {
+        await database.execAsync('ALTER TABLE location_updates ADD COLUMN server_saved INTEGER NOT NULL DEFAULT 0');
+      }
+      if (!existingColumns.has('fix_key')) {
+        await database.execAsync('ALTER TABLE location_updates ADD COLUMN fix_key TEXT');
+      }
+      await database.execAsync('CREATE UNIQUE INDEX IF NOT EXISTS location_updates_fix_key ON location_updates(fix_key)');
+      await database.execAsync("UPDATE location_updates SET status = 'pending' WHERE server_saved = 0 AND status = 'success'");
       const id = await database.getFirstAsync<{ value: string }>(
         "SELECT value FROM settings WHERE key = 'deviceId'"
       );
@@ -66,7 +83,7 @@ export async function getDatabase() {
       const interval = await database.getFirstAsync<{ value: string }>(
         "SELECT value FROM settings WHERE key = 'intervalSeconds'"
       );
-      if (interval?.value !== '10') await setSetting('intervalSeconds', '10');
+      if (interval?.value !== '5') await setSetting('intervalSeconds', '5');
       const enabled = await database.getFirstAsync<{ value: string }>(
         "SELECT value FROM settings WHERE key = 'enabled'"
       );
@@ -87,7 +104,7 @@ export async function getSettings(): Promise<TrackingSettings> {
     deviceId: values.deviceId,
     deviceName: values.deviceName,
     enabled: values.enabled === 'true',
-    intervalSeconds: 10,
+    intervalSeconds: 5,
   };
 }
 
@@ -101,16 +118,17 @@ export async function setSetting(key: string, value: string): Promise<void> {
 }
 
 export async function saveLocation(
-  update: Omit<LocationUpdate, 'request_body_bytes' | 'response_body_bytes' | 'upload_bytes' | 'download_bytes' | 'total_bytes' | 'status' | 'error'>,
+  update: Omit<LocationUpdate, 'uploaded_at' | 'server_received_at' | 'server_saved' | 'request_body_bytes' | 'response_body_bytes' | 'upload_bytes' | 'download_bytes' | 'total_bytes' | 'status' | 'error'>,
   status: LocationUpdate['status'] = 'pending'
-): Promise<void> {
+): Promise<boolean> {
   const database = await getDatabase();
-  await database.runAsync(
+  const result = await database.runAsync(
     `INSERT OR IGNORE INTO location_updates
-      (id, device_id, created_at, latitude, longitude, accuracy, altitude, speed, heading, coordinate_bytes, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, device_id, fix_key, created_at, latitude, longitude, accuracy, altitude, speed, heading, coordinate_bytes, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     update.id,
     update.device_id,
+    update.fix_key,
     update.created_at,
     update.latitude,
     update.longitude,
@@ -121,19 +139,23 @@ export async function saveLocation(
     update.coordinate_bytes,
     status
   );
+  return result.changes === 1;
 }
 
 export async function updateUsage(
   id: string,
   values: Pick<LocationUpdate, 'request_body_bytes' | 'response_body_bytes' | 'upload_bytes' | 'download_bytes' | 'total_bytes'>,
   status: LocationUpdate['status'],
-  error: string | null = null
+  error: string | null = null,
+  timestamps: Pick<LocationUpdate, 'uploaded_at' | 'server_received_at'> = { uploaded_at: null, server_received_at: null },
+  serverSaved = false
 ): Promise<void> {
   const database = await getDatabase();
   await database.runAsync(
     `UPDATE location_updates
      SET request_body_bytes = ?, response_body_bytes = ?, upload_bytes = ?,
-         download_bytes = ?, total_bytes = ?, status = ?, error = ?
+         download_bytes = ?, total_bytes = ?, status = ?, error = ?, uploaded_at = ?, server_received_at = ?,
+         server_saved = CASE WHEN ? = 1 THEN 1 ELSE server_saved END
      WHERE id = ?`,
     values.request_body_bytes,
     values.response_body_bytes,
@@ -142,6 +164,9 @@ export async function updateUsage(
     values.total_bytes,
     status,
     error,
+    timestamps.uploaded_at,
+    timestamps.server_received_at,
+    serverSaved ? 1 : 0,
     id
   );
 }
@@ -156,7 +181,7 @@ export async function getLocations(): Promise<LocationUpdate[]> {
 export async function getPendingLocations(): Promise<LocationUpdate[]> {
   const database = await getDatabase();
   return database.getAllAsync<LocationUpdate>(
-    "SELECT * FROM location_updates WHERE status IN ('pending', 'failed') ORDER BY created_at ASC"
+    "SELECT * FROM location_updates WHERE server_saved = 0 AND status IN ('pending', 'failed') ORDER BY created_at ASC, id ASC"
   );
 }
 
@@ -167,13 +192,32 @@ export async function getLatestLocation(): Promise<LocationUpdate | null> {
   );
 }
 
-export async function hasLocationTimestamp(timestamp: string): Promise<boolean> {
+export async function markLocationsServerSaved(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
   const database = await getDatabase();
-  const existing = await database.getFirstAsync<{ found: number }>(
-    'SELECT 1 AS found FROM location_updates WHERE created_at = ? LIMIT 1',
-    timestamp
-  );
-  return existing !== null;
+  const batchSize = 400;
+  for (let offset = 0; offset < ids.length; offset += batchSize) {
+    const batch = ids.slice(offset, offset + batchSize);
+    const placeholders = batch.map(() => '?').join(', ');
+    await database.runAsync(
+      `UPDATE location_updates SET server_saved = 1, status = 'success', error = NULL WHERE id IN (${placeholders})`,
+      ...batch
+    );
+  }
+}
+
+export async function markLocationsMissingFromServer(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const database = await getDatabase();
+  const batchSize = 400;
+  for (let offset = 0; offset < ids.length; offset += batchSize) {
+    const batch = ids.slice(offset, offset + batchSize);
+    const placeholders = batch.map(() => '?').join(', ');
+    await database.runAsync(
+      `UPDATE location_updates SET server_saved = 0, status = 'pending', error = NULL WHERE id IN (${placeholders})`,
+      ...batch
+    );
+  }
 }
 
 export async function getUsageTotals(): Promise<UsageTotals> {

@@ -3,7 +3,10 @@ export type UpdateStatus = 'pending' | 'success' | 'failed';
 export type LocationUpdate = {
   id: string;
   device_id: string;
+  fix_key: string | null;
   created_at: string;
+  uploaded_at: string | null;
+  server_received_at: string | null;
   latitude: number;
   longitude: number;
   accuracy: number | null;
@@ -18,6 +21,7 @@ export type LocationUpdate = {
   total_bytes: number;
   status: UpdateStatus;
   error: string | null;
+  server_saved: number;
 };
 
 export type TrackingSettings = {
