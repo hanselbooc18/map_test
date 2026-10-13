@@ -431,6 +431,54 @@ export async function getRemoteHistory(settings: TrackingSettings): Promise<unkn
   return getAuthenticatedJson(settings, `/devices/${encodeURIComponent(settings.deviceId)}/locations`);
 }
 
+export type RemoteLocation = {
+  id: number;
+  device_id: number;
+  update_id: string;
+  recorded_at: string | null;
+  gps_fix_at: string | null;
+  uploaded_at: string | null;
+  server_received_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  latitude: number;
+  longitude: number;
+  accuracy: number | null;
+  altitude: number | null;
+  speed: number | null;
+  heading: number | null;
+};
+
+export async function getAllRemoteHistory(
+  settings: TrackingSettings,
+  from: string,
+  to: string
+): Promise<{ records: RemoteLocation[]; total: number }> {
+  const records: RemoteLocation[] = [];
+  let page = 1;
+  let lastPage = 1;
+  let total = 0;
+  const dateParams = new URLSearchParams();
+  if (from) dateParams.set('from', `${from}T00:00:00`);
+  if (to) dateParams.set('to', `${to}T23:59:59.999`);
+  do {
+    dateParams.set('limit', '100');
+    dateParams.set('page', String(page));
+    const result = await getAuthenticatedJson<{
+      items?: RemoteLocation[];
+      pagination?: { lastPage?: number; total?: number };
+    }>(settings, `/devices/${encodeURIComponent(settings.deviceId)}/locations?${dateParams.toString()}`);
+    if (!Array.isArray(result.items) || !result.pagination) {
+      throw new ApiError('Laravel returned an invalid location history response.');
+    }
+    records.push(...result.items);
+    total = result.pagination.total ?? total;
+    lastPage = Math.max(1, result.pagination.lastPage ?? 1);
+    page += 1;
+  } while (page <= lastPage);
+  return { records, total };
+}
+
 export async function getRemoteLocationIds(settings: TrackingSettings): Promise<string[]> {
   const ids: string[] = [];
   let page = 1;

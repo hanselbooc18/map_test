@@ -5,6 +5,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  type TextStyle,
   View,
   type ViewProps,
 } from 'react-native';
@@ -57,7 +58,7 @@ export function Label({ children }: { children: React.ReactNode }) {
   return <Text style={styles.label}>{children}</Text>;
 }
 
-export function Value({ children, style }: { children: React.ReactNode; style?: ViewProps['style'] }) {
+export function Value({ children, style }: { children: React.ReactNode; style?: TextStyle }) {
   return <Text style={[styles.value, style]}>{children}</Text>;
 }
 
